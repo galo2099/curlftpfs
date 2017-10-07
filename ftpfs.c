@@ -1625,9 +1625,14 @@ static void set_common_curl_stuff(CURL* easy) {
   }
 
   if (ftpfs.no_verify_hostname) {
-    /* The default is 2 which verifies even the host string. This sets to 1
-     * which means verify the host but not the string. */
-    curl_easy_setopt_or_die(easy, CURLOPT_SSL_VERIFYHOST, 1);
+    /* https://curl.haxx.se/libcurl/c/CURLOPT_SSL_VERIFYHOST.html */
+    /* 2(default): Certificate must indicate that the server is the server to
+     * which you meant to connect.
+     * 
+     * 0: Connection succeeds regardless of the names in the certificate. Use 
+     * that ability with caution!
+     */
+    curl_easy_setopt_or_die(easy, CURLOPT_SSL_VERIFYHOST, 0);
   }
 
   curl_easy_setopt_or_die(easy, CURLOPT_INTERFACE, ftpfs.interface);
