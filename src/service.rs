@@ -33,6 +33,7 @@ impl FtpFsService {
     pub fn readdir(&self, path: &str) -> Result<Vec<ParsedEntry>, i32> {
         if let CacheLookup::Hit(names) = self.cache.get_dir(path) {
             let mut out = Vec::new();
+            let mut complete = true;
             for name in names {
                 let full = format!("{}{}", path, name);
                 if let CacheLookup::Hit(st) = self.cache.get_attr(&full) {
@@ -42,9 +43,12 @@ impl FtpFsService {
                         stat: st,
                         symlink_target: None,
                     });
+                } else {
+                    complete = false;
+                    break;
                 }
             }
-            if !out.is_empty() {
+            if complete {
                 return Ok(out);
             }
         }

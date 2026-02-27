@@ -60,3 +60,21 @@ fn fuse_lifecycle_and_readdir_getattr_readlink_read_and_write_path() {
 
     fuse.destroy();
 }
+
+#[test]
+fn readdir_does_not_return_partial_results_when_some_child_attrs_expire_or_invalidate() {
+    let service = make_service();
+
+    // Warm cache with a full listing + attrs.
+    let first = service.readdir("/dir/").expect("first readdir");
+    assert_eq!(first.len(), 2);
+
+    // Invalidate one child attr while leaving the cached dir entry list in place.
+    service.cache.invalidate("/dir/file.txt");
+
+    // Must fall back to transport/list parsing to avoid returning a partial directory view.
+    let second = service.readdir("/dir/").expect("second readdir");
+    assert_eq!(second.len(), 2);
+    assert!(second.iter().any(|e| e.name == "file.txt"));
+    assert!(second.iter().any(|e| e.name == "lnk"));
+}
