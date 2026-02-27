@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use clap::{CommandFactory, Parser, Subcommand};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliMode {
     Parse {
@@ -12,39 +14,48 @@ pub enum CliMode {
     },
 }
 
-pub fn parse_args(args: &[String]) -> Result<CliMode, String> {
-    if args.len() < 2 {
-        return Err(usage());
-    }
+#[derive(Debug, Parser)]
+#[command(
+    name = "curlftpfs",
+    about = "Rust curlftpfs port",
+    after_help = "The mount mode uses the Rust FUSE implementation."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    match args[1].as_str() {
-        "parse" => {
-            let Some(path) = args.get(2) else {
-                return Err(format!("missing listing file\n\n{}", usage()));
-            };
-            Ok(CliMode::Parse {
-                listing_file: PathBuf::from(path),
-            })
-        }
-        "mount" => {
-            let Some(site) = args.get(2) else {
-                return Err(format!("missing ftp site\n\n{}", usage()));
-            };
-            let Some(mountpoint) = args.get(3) else {
-                return Err(format!("missing mountpoint\n\n{}", usage()));
-            };
-            Ok(CliMode::Mount {
-                ftp_site: site.clone(),
-                mountpoint: mountpoint.clone(),
-                extra_options: args[4..].to_vec(),
-            })
-        }
-        _ => Err(usage()),
-    }
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Parse an FTP LIST output file
+    Parse { listing_file: PathBuf },
+    /// Mount an FTP site using the Rust FUSE implementation
+    Mount {
+        ftp_site: String,
+        mountpoint: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra_options: Vec<String>,
+    },
+}
+
+pub fn parse_args(args: &[String]) -> Result<CliMode, String> {
+    let cli = Cli::try_parse_from(args).map_err(|e| e.to_string())?;
+    Ok(match cli.command {
+        Commands::Parse { listing_file } => CliMode::Parse { listing_file },
+        Commands::Mount {
+            ftp_site,
+            mountpoint,
+            extra_options,
+        } => CliMode::Mount {
+            ftp_site,
+            mountpoint,
+            extra_options,
+        },
+    })
 }
 
 pub fn usage() -> String {
-    "usage:\n  curlftpfs parse <listing-file>\n  curlftpfs mount <ftp-site> <mountpoint> [legacy curlftpfs options...]\n\nThe mount mode uses the Rust FUSE implementation.".to_string()
+    Cli::command().render_help().to_string()
 }
 
 pub fn is_self_delegate(current_exe: &Path, legacy_bin: &Path) -> bool {

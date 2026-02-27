@@ -8,3 +8,4 @@ license = "GPL-2.0-or-later"
 fuser = "0.14"
 iconv = "0.1"
 curl = "0.4"
+clap = { version = "4", features = ["derive"] }
