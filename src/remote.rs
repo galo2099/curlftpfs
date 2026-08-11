@@ -235,39 +235,118 @@ pub struct ListEntry {
     pub modified: i64,
 }
 fn parse_listing(s: &str) -> Vec<ListEntry> {
-    s.lines()
-        .filter_map(|line| {
-            let line = line.trim_matches(['\r', '\n']);
-            let (facts, name) = line.split_once(' ')?;
-            let mut x = ListEntry {
-                name: name.into(),
-                size: 0,
-                directory: false,
-                symlink: false,
-                modified: 0,
-            };
-            for f in facts.split(';') {
-                let Some((k, v)) = f.split_once('=') else {
-                    continue;
-                };
-                match k.to_ascii_lowercase().as_str() {
-                    "type" => {
-                        x.directory = v.eq_ignore_ascii_case("dir")
-                            || v.eq_ignore_ascii_case("cdir")
-                            || v.eq_ignore_ascii_case("pdir");
-                        x.symlink = v.to_ascii_lowercase().contains("slink")
-                    }
-                    "size" => x.size = v.parse().unwrap_or(0),
-                    _ => {}
-                }
+    s.lines().filter_map(parse_listing_line).collect()
+}
+
+fn parse_listing_line(line: &str) -> Option<ListEntry> {
+    let line = line.trim_matches(['\r', '\n']);
+    parse_mlsd(line)
+        .or_else(|| parse_dir_unix(line))
+        .or_else(|| parse_dir_windows(line))
+}
+
+fn parse_mlsd(line: &str) -> Option<ListEntry> {
+    let (facts, name) = line.split_once(' ')?;
+    if !facts.contains('=') {
+        return None;
+    }
+    let mut x = ListEntry {
+        name: name.into(),
+        size: 0,
+        directory: false,
+        symlink: false,
+        modified: 0,
+    };
+    for f in facts.split(';') {
+        let Some((k, v)) = f.split_once('=') else {
+            continue;
+        };
+        match k.to_ascii_lowercase().as_str() {
+            "type" => {
+                x.directory = v.eq_ignore_ascii_case("dir")
+                    || v.eq_ignore_ascii_case("cdir")
+                    || v.eq_ignore_ascii_case("pdir");
+                x.symlink = v.to_ascii_lowercase().contains("slink")
             }
-            if name == "." || name == ".." {
-                None
-            } else {
-                Some(x)
-            }
+            "size" => x.size = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    (name != "." && name != "..").then_some(x)
+}
+
+/// Parse the traditional `LIST` format emitted by Unix FTP servers.
+///
+/// This is the Rust equivalent of the old `parse_dir_unix`: it accepts both
+/// listings with and without a link-count column and retains names containing
+/// whitespace. Symlink targets are removed from the displayed filename.
+fn parse_dir_unix(line: &str) -> Option<ListEntry> {
+    let fields: Vec<(usize, &str)> = line
+        .match_indices(|c: char| !c.is_whitespace())
+        .filter(|(i, _)| {
+            *i == 0
+                || line[..*i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace)
         })
-        .collect()
+        .map(|(start, _)| {
+            let end = line[start..]
+                .find(char::is_whitespace)
+                .map_or(line.len(), |n| start + n);
+            (start, &line[start..end])
+        })
+        .collect();
+    let mode = fields.first()?.1;
+    if mode.len() < 10 || !matches!(mode.as_bytes()[0], b'-' | b'd' | b'l') {
+        return None;
+    }
+    let has_nlink = fields.get(1)?.1.parse::<u64>().is_ok();
+    let size_index = if has_nlink { 4 } else { 3 };
+    let name_index = if has_nlink { 8 } else { 7 };
+    let size = fields.get(size_index)?.1.parse().ok()?;
+    let name_start = fields.get(name_index)?.0;
+    let mut name = line[name_start..].to_owned();
+    let symlink = mode.starts_with('l');
+    if symlink {
+        if let Some((file, _target)) = name.split_once(" -> ") {
+            name = file.to_owned();
+        }
+    }
+    Some(ListEntry {
+        name,
+        size,
+        directory: mode.starts_with('d'),
+        symlink,
+        modified: 0,
+    })
+}
+
+fn parse_dir_windows(line: &str) -> Option<ListEntry> {
+    let mut fields = line.split_whitespace();
+    let date = fields.next()?;
+    let time = fields.next()?;
+    let size_or_dir = fields.next()?;
+    if !date.contains('-') || !(time.ends_with("AM") || time.ends_with("PM")) {
+        return None;
+    }
+    let name = fields.collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        return None;
+    }
+    let directory = size_or_dir.eq_ignore_ascii_case("<DIR>");
+    let size = if directory {
+        0
+    } else {
+        size_or_dir.parse().ok()?
+    };
+    Some(ListEntry {
+        name,
+        size,
+        directory,
+        symlink: false,
+        modified: 0,
+    })
 }
 fn url_encode(s: &str) -> String {
     s.bytes()
@@ -300,6 +379,26 @@ mod tests {
         assert_eq!(v[0].name, "a.txt");
         assert_eq!(v[0].size, 12);
         assert!(v[1].directory);
+    }
+    #[test]
+    fn parses_unix_list_with_spaces_and_symlinks() {
+        let v = parse_listing("-rw-r--r-- 1 alice users 12 Jan 02 2025 file with spaces.txt\r\nlrwxrwxrwx 1 root root 4 Feb 03 12:30 link -> dest\r\n");
+        assert_eq!(v[0].name, "file with spaces.txt");
+        assert_eq!(v[0].size, 12);
+        assert_eq!(v[1].name, "link");
+        assert!(v[1].symlink);
+    }
+    #[test]
+    fn parses_unix_list_without_link_count() {
+        let v = parse_listing("drwxr-xr-x owner group 4096 Mar 04 2024 directory\n");
+        assert_eq!(v[0].name, "directory");
+        assert!(v[0].directory);
+    }
+    #[test]
+    fn parses_windows_list() {
+        let v = parse_listing("01-02-24  03:04PM       <DIR>          My Folder\r\n");
+        assert_eq!(v[0].name, "My Folder");
+        assert!(v[0].directory);
     }
     #[test]
     fn escapes_paths() {
