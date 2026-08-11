@@ -40,7 +40,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let fs = filesystem::FtpFs::new(remote, parsed.cache_timeout);
+    let fs = filesystem::FtpFs::new(
+        remote,
+        parsed.cache_timeout,
+        parsed.mountpoint.clone(),
+        parsed.curl.transform_symlinks,
+    );
     let mut mount_options = vec![
         MountOption::FSName("curlftpfs".into()),
         MountOption::Subtype("curlftpfs".into()),

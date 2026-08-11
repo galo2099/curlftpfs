@@ -1,3 +1,4 @@
+use chrono::{Datelike, Local, NaiveDateTime, TimeZone};
 use curl::easy::{Easy, IpResolve, ProxyType};
 use std::{io, path::Path, sync::Mutex, time::Duration};
 
@@ -38,6 +39,13 @@ pub struct CurlConfig {
     pub proxy_tunnel: bool,
     pub proxy_type: ProxyType,
     pub ip: IpResolve,
+    pub proxy_auth: u64,
+    pub ssl_version: Option<i64>,
+    pub engine: Option<String>,
+    pub krb4: Option<String>,
+    pub codepage: Option<String>,
+    pub iocharset: Option<String>,
+    pub transform_symlinks: bool,
 }
 impl Default for CurlConfig {
     fn default() -> Self {
@@ -69,6 +77,13 @@ impl Default for CurlConfig {
             proxy_tunnel: false,
             proxy_type: ProxyType::Http,
             ip: IpResolve::Any,
+            proxy_auth: 0,
+            ssl_version: None,
+            engine: None,
+            krb4: None,
+            codepage: None,
+            iocharset: None,
+            transform_symlinks: false,
         }
     }
 }
@@ -109,6 +124,52 @@ impl Remote {
         e.ssl_verify_host(self.cfg.verify_host).map_err(err)?;
         e.ssl_verify_peer(self.cfg.verify_peer).map_err(err)?;
         e.ip_resolve(self.cfg.ip).map_err(err)?;
+        setopt_long(&e, curl_sys::CURLOPT_FTP_USE_EPSV, self.cfg.epsv as i64)?;
+        setopt_long(&e, curl_sys::CURLOPT_FTP_USE_EPRT, self.cfg.eprt as i64)?;
+        setopt_long(
+            &e,
+            curl_sys::CURLOPT_FTP_SKIP_PASV_IP,
+            self.cfg.skip_pasv_ip as i64,
+        )?;
+        setopt_long(
+            &e,
+            curl_sys::CURLOPT_USE_SSL,
+            match self.cfg.ssl {
+                SslMode::Off => 0,
+                SslMode::Try => 1,
+                SslMode::Control => 2,
+                SslMode::All => 3,
+            },
+        )?;
+        if let Some(method) = &self.cfg.ftp_method {
+            let method = match method.as_str() {
+                "multicwd" => 1,
+                "nocwd" => 2,
+                "singlecwd" => 3,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ftp_method must be multicwd, nocwd, or singlecwd",
+                    ))
+                }
+            };
+            setopt_long(&e, curl_sys::CURLOPT_FTP_FILEMETHOD, method)?;
+        }
+        if let Some(version) = self.cfg.ssl_version {
+            setopt_long(&e, curl_sys::CURLOPT_SSLVERSION, version)?;
+        }
+        if self.cfg.proxy_auth != 0 {
+            setopt_long(&e, curl_sys::CURLOPT_PROXYAUTH, self.cfg.proxy_auth as i64)?;
+        }
+        if let Some(v) = &self.cfg.ftp_port {
+            setopt_string(&e, curl_sys::CURLOPT_FTPPORT, v)?;
+        }
+        if let Some(v) = &self.cfg.engine {
+            setopt_string(&e, curl_sys::CURLOPT_SSLENGINE, v)?;
+        }
+        if let Some(v) = &self.cfg.krb4 {
+            setopt_string(&e, curl_sys::CURLOPT_KRBLEVEL, v)?;
+        }
         if let Some(v) = &self.cfg.user {
             let (u, p) = v.split_once(':').unwrap_or((v, ""));
             e.username(u).map_err(err)?;
@@ -189,9 +250,18 @@ impl Remote {
     }
     pub fn list(&self, path: &Path) -> io::Result<Vec<ListEntry>> {
         let _g = self.lock.lock().unwrap();
+        if let Some(command) = &self.cfg.custom_list {
+            return self.list_command(path, command);
+        }
+        // MLSD is machine-readable but is not implemented by many older FTP
+        // servers. Preserve curlftpfs compatibility by retrying with LIST.
+        self.list_command(path, "MLSD")
+            .or_else(|_| self.list_command(path, "LIST"))
+    }
+
+    fn list_command(&self, path: &Path, command: &str) -> io::Result<Vec<ListEntry>> {
         let mut e = self.easy(path)?;
-        e.custom_request(self.cfg.custom_list.as_deref().unwrap_or("MLSD"))
-            .map_err(err)?;
+        e.custom_request(command).map_err(err)?;
         let mut out = Vec::new();
         {
             let mut t = e.transfer();
@@ -202,7 +272,34 @@ impl Remote {
             .map_err(err)?;
             t.perform().map_err(err)?;
         }
-        Ok(parse_listing(&String::from_utf8_lossy(&out)))
+        let listing = if let Some(label) = &self.cfg.codepage {
+            let encoding = encoding_rs::Encoding::for_label(label.as_bytes()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown codepage {label}"),
+                )
+            })?;
+            if self.cfg.iocharset.as_deref().is_some_and(|charset| {
+                !charset.eq_ignore_ascii_case("UTF-8") && !charset.eq_ignore_ascii_case("UTF8")
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "only UTF-8 iocharset is supported by the Rust path API",
+                ));
+            }
+            encoding.decode(&out).0
+        } else {
+            String::from_utf8_lossy(&out)
+        };
+        let parsed = parse_listing(&listing);
+        if parsed.is_empty() && !out.is_empty() {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported {command} directory listing"),
+            ))
+        } else {
+            Ok(parsed)
+        }
     }
     pub fn command(&self, path: &Path, command: String) -> io::Result<()> {
         let _g = self.lock.lock().unwrap();
@@ -233,6 +330,9 @@ pub struct ListEntry {
     pub directory: bool,
     pub symlink: bool,
     pub modified: i64,
+    pub link_target: Option<String>,
+    pub perm: u16,
+    pub nlink: u32,
 }
 fn parse_listing(s: &str) -> Vec<ListEntry> {
     s.lines().filter_map(parse_listing_line).collect()
@@ -256,6 +356,9 @@ fn parse_mlsd(line: &str) -> Option<ListEntry> {
         directory: false,
         symlink: false,
         modified: 0,
+        link_target: None,
+        perm: 0,
+        nlink: 1,
     };
     for f in facts.split(';') {
         let Some((k, v)) = f.split_once('=') else {
@@ -266,9 +369,21 @@ fn parse_mlsd(line: &str) -> Option<ListEntry> {
                 x.directory = v.eq_ignore_ascii_case("dir")
                     || v.eq_ignore_ascii_case("cdir")
                     || v.eq_ignore_ascii_case("pdir");
-                x.symlink = v.to_ascii_lowercase().contains("slink")
+                x.symlink = v.to_ascii_lowercase().contains("slink");
+                if let Some((_, target)) = v.split_once(':') {
+                    x.link_target = Some(target.to_owned());
+                }
             }
             "size" => x.size = v.parse().unwrap_or(0),
+            "unix.mode" => x.perm = u16::from_str_radix(v, 8).unwrap_or(0) & 0o7777,
+            "modify" => {
+                x.modified = NaiveDateTime::parse_from_str(
+                    v.trim_end_matches(|c: char| !c.is_ascii_digit()),
+                    "%Y%m%d%H%M%S",
+                )
+                .map(|date| date.and_utc().timestamp())
+                .unwrap_or(0)
+            }
             _ => {}
         }
     }
@@ -301,15 +416,21 @@ fn parse_dir_unix(line: &str) -> Option<ListEntry> {
     if mode.len() < 10 || !matches!(mode.as_bytes()[0], b'-' | b'd' | b'l') {
         return None;
     }
-    let has_nlink = fields.get(1)?.1.parse::<u64>().is_ok();
+    let parsed_nlink = fields.get(1)?.1.parse::<u32>().ok();
+    let has_nlink = parsed_nlink.is_some();
     let size_index = if has_nlink { 4 } else { 3 };
     let name_index = if has_nlink { 8 } else { 7 };
     let size = fields.get(size_index)?.1.parse().ok()?;
+    let month = fields.get(size_index + 1)?.1;
+    let day = fields.get(size_index + 2)?.1;
+    let year_or_time = fields.get(size_index + 3)?.1;
     let name_start = fields.get(name_index)?.0;
     let mut name = line[name_start..].to_owned();
     let symlink = mode.starts_with('l');
+    let mut link_target = None;
     if symlink {
         if let Some((file, _target)) = name.split_once(" -> ") {
+            link_target = name.split_once(" -> ").map(|(_, target)| target.to_owned());
             name = file.to_owned();
         }
     }
@@ -318,7 +439,19 @@ fn parse_dir_unix(line: &str) -> Option<ListEntry> {
         size,
         directory: mode.starts_with('d'),
         symlink,
-        modified: 0,
+        modified: parse_unix_date(month, day, year_or_time),
+        link_target,
+        perm: mode.as_bytes()[1..10]
+            .iter()
+            .enumerate()
+            .fold(0, |bits, (i, c)| {
+                if *c != b'-' {
+                    bits | 1 << (8 - i)
+                } else {
+                    bits
+                }
+            }),
+        nlink: parsed_nlink.unwrap_or(1),
     })
 }
 
@@ -345,8 +478,37 @@ fn parse_dir_windows(line: &str) -> Option<ListEntry> {
         size,
         directory,
         symlink: false,
-        modified: 0,
+        modified: parse_windows_date(date, time),
+        link_target: None,
+        perm: if directory { 0o755 } else { 0o644 },
+        nlink: 1,
     })
+}
+
+fn parse_unix_date(month: &str, day: &str, year_or_time: &str) -> i64 {
+    let now = Local::now();
+    let text = if year_or_time.contains(':') {
+        format!("{} {month} {day} {year_or_time}", now.year())
+    } else {
+        format!("{year_or_time} {month} {day} 00:00")
+    };
+    let Ok(mut date) = NaiveDateTime::parse_from_str(&text, "%Y %b %d %H:%M") else {
+        return 0;
+    };
+    if year_or_time.contains(':') && date > now.naive_local() + chrono::Duration::days(1) {
+        date = date.with_year(date.year() - 1).unwrap_or(date);
+    }
+    Local
+        .from_local_datetime(&date)
+        .single()
+        .map_or(0, |date| date.timestamp())
+}
+
+fn parse_windows_date(date: &str, time: &str) -> i64 {
+    NaiveDateTime::parse_from_str(&format!("{date} {time}"), "%m-%d-%y %I:%M%p")
+        .ok()
+        .and_then(|date| Local.from_local_datetime(&date).single())
+        .map_or(0, |date| date.timestamp())
 }
 fn url_encode(s: &str) -> String {
     s.bytes()
@@ -370,6 +532,22 @@ fn err(e: curl::Error) -> io::Error {
     io::Error::new(code, e)
 }
 
+fn setopt_long(e: &Easy, option: curl_sys::CURLoption, value: i64) -> io::Result<()> {
+    let result = unsafe { curl_sys::curl_easy_setopt(e.raw(), option, value as libc::c_long) };
+    (result == curl_sys::CURLE_OK)
+        .then_some(())
+        .ok_or_else(|| io::Error::other(format!("libcurl setopt {option} failed: {result}")))
+}
+
+fn setopt_string(e: &Easy, option: curl_sys::CURLoption, value: &str) -> io::Result<()> {
+    let value = std::ffi::CString::new(value)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in curl option"))?;
+    let result = unsafe { curl_sys::curl_easy_setopt(e.raw(), option, value.as_ptr()) };
+    (result == curl_sys::CURLE_OK)
+        .then_some(())
+        .ok_or_else(|| io::Error::other(format!("libcurl setopt {option} failed: {result}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,12 +565,17 @@ mod tests {
         assert_eq!(v[0].size, 12);
         assert_eq!(v[1].name, "link");
         assert!(v[1].symlink);
+        assert_eq!(v[1].link_target.as_deref(), Some("dest"));
+        assert_eq!(v[0].perm, 0o644);
+        assert_eq!(v[0].nlink, 1);
+        assert!(v[0].modified > 0);
     }
     #[test]
     fn parses_unix_list_without_link_count() {
         let v = parse_listing("drwxr-xr-x owner group 4096 Mar 04 2024 directory\n");
         assert_eq!(v[0].name, "directory");
         assert!(v[0].directory);
+        assert!(v[0].modified > 0);
     }
     #[test]
     fn parses_windows_list() {

@@ -2,7 +2,7 @@ CurlFtpFS
 =========
 
 CurlFtpFS mounts an FTP or FTPS server as a local filesystem. This version is
-implemented in safe Rust and uses the `fuser` FUSE library and the `curl` crate
+implemented in Rust and uses the `fuser` FUSE library and the `curl` crate
 (libcurl) for transport. It reconnects on each operation, so an FTP server
 closing an idle control connection does not invalidate the mount.
 
@@ -37,11 +37,13 @@ and metadata cache settings. Standard FUSE mount options are passed to FUSE.
 Filesystem behavior
 -------------------
 
-Directory metadata is obtained with MLSD by default. Reads are downloaded
+Directory metadata is obtained with MLSD by default, with automatic fallback
+to traditional Unix or Windows `LIST` formats for older servers. Reads are downloaded
 through libcurl. A writable file handle is buffered and uploaded on flush or
 close, which preserves random-write behavior expected by editors while working
 within FTP's whole-object upload model. Create, truncate, mkdir, unlink, rmdir,
-and rename operations are translated into FTP operations.
+rename, chmod, readlink, fsync, and statfs operations are translated or
+synthesized using the same FTP-compatible behavior as the original program.
 
 FTP does not provide all POSIX semantics. Ownership and permissions are
 therefore synthesized locally, and concurrent writers to one remote path use

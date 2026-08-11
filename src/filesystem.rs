@@ -1,7 +1,7 @@
 use crate::remote::{ListEntry, Remote};
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use std::{
     collections::HashMap,
@@ -20,6 +20,9 @@ struct Node {
     kind: FileType,
     size: u64,
     mtime: SystemTime,
+    link_target: Option<String>,
+    perm: u16,
+    nlink: u32,
 }
 struct Handle {
     path: PathBuf,
@@ -37,15 +40,25 @@ pub struct FtpFs {
     remote: Arc<Remote>,
     state: Mutex<State>,
     ttl: Duration,
+    mountpoint: PathBuf,
+    transform_symlinks: bool,
 }
 impl FtpFs {
-    pub fn new(remote: Remote, ttl: Duration) -> Self {
+    pub fn new(
+        remote: Remote,
+        ttl: Duration,
+        mountpoint: PathBuf,
+        transform_symlinks: bool,
+    ) -> Self {
         let root = Node {
             ino: ROOT,
             path: "/".into(),
             kind: FileType::Directory,
             size: 0,
             mtime: SystemTime::now(),
+            link_target: None,
+            perm: 0o755,
+            nlink: 2,
         };
         let mut by_ino = HashMap::new();
         by_ino.insert(ROOT, root);
@@ -61,6 +74,8 @@ impl FtpFs {
                 handles: HashMap::new(),
             }),
             ttl,
+            mountpoint,
+            transform_symlinks,
         }
     }
     fn attr(n: &Node) -> FileAttr {
@@ -73,12 +88,16 @@ impl FtpFs {
             ctime: n.mtime,
             crtime: n.mtime,
             kind: n.kind,
-            perm: if n.kind == FileType::Directory {
-                0o755
+            perm: if n.perm == 0 {
+                if n.kind == FileType::Directory {
+                    0o755
+                } else {
+                    0o644
+                }
             } else {
-                0o644
+                n.perm
             },
-            nlink: if n.kind == FileType::Directory { 2 } else { 1 },
+            nlink: n.nlink,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             rdev: 0,
@@ -101,6 +120,10 @@ impl FtpFs {
             } else {
                 FileType::RegularFile
             };
+            n.mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(e.modified.max(0) as u64);
+            n.link_target = e.link_target.clone();
+            n.perm = e.perm;
+            n.nlink = e.nlink;
             return n.clone();
         }
         let ino = s.next_ino;
@@ -117,6 +140,9 @@ impl FtpFs {
             },
             size: e.size,
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(e.modified.max(0) as u64),
+            link_target: e.link_target.clone(),
+            perm: e.perm,
+            nlink: e.nlink,
         };
         s.by_path.insert(path, ino);
         s.by_ino.insert(ino, n.clone());
@@ -139,23 +165,78 @@ impl FtpFs {
             s.by_ino.remove(&i);
         }
     }
+    fn refresh_node(&self, node: &Node) -> io::Result<Option<Node>> {
+        if node.ino == ROOT {
+            return Ok(Some(node.clone()));
+        }
+        let Some(parent) = node.path.parent() else {
+            return Ok(None);
+        };
+        let Some(name) = node.path.file_name() else {
+            return Ok(None);
+        };
+        Ok(self
+            .remote
+            .list(parent)?
+            .iter()
+            .find(|entry| OsStr::new(&entry.name) == name)
+            .map(|entry| self.intern(node.path.clone(), entry)))
+    }
 }
 impl Filesystem for FtpFs {
     fn getattr(&mut self, _: &Request<'_>, ino: u64, reply: ReplyAttr) {
         match self.node(ino) {
-            Some(n) => reply.attr(&self.ttl, &Self::attr(&n)),
+            Some(n) => match self.refresh_node(&n) {
+                Ok(Some(n)) => reply.attr(&self.ttl, &Self::attr(&n)),
+                Ok(None) => {
+                    self.remove_node(&n.path);
+                    reply.error(libc::ENOENT)
+                }
+                Err(e) => reply.error(Self::errno(&e)),
+            },
             None => reply.error(libc::ENOENT),
         }
+    }
+    fn readlink(&mut self, _: &Request<'_>, ino: u64, reply: ReplyData) {
+        match self.node(ino) {
+            Some(n) if n.kind == FileType::Symlink => match n.link_target {
+                Some(target) => {
+                    if self.transform_symlinks && target.starts_with('/') {
+                        reply.data(
+                            self.mountpoint
+                                .join(target.trim_start_matches('/'))
+                                .as_os_str()
+                                .as_encoded_bytes(),
+                        )
+                    } else {
+                        reply.data(target.as_bytes())
+                    }
+                }
+                None => reply.error(libc::EIO),
+            },
+            Some(_) => reply.error(libc::EINVAL),
+            None => reply.error(libc::ENOENT),
+        }
+    }
+    fn statfs(&mut self, _: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        // FTP has no capacity query. Match the legacy implementation's
+        // synthetic, effectively-unlimited statfs result.
+        reply.statfs(
+            1_999_999_998,
+            1_999_999_998,
+            1_999_999_998,
+            999_999_999,
+            999_999_999,
+            4096,
+            255,
+            4096,
+        );
     }
     fn lookup(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let Some(p) = self.node(parent) else {
             return reply.error(libc::ENOENT);
         };
         let path = Self::child(&p, name);
-        if let Some(i) = self.state.lock().unwrap().by_path.get(&path).copied() {
-            let n = self.node(i).unwrap();
-            return reply.entry(&self.ttl, &Self::attr(&n), 0);
-        }
         match self.remote.list(&p.path) {
             Ok(entries) => {
                 if let Some(e) = entries.iter().find(|e| OsStr::new(&e.name) == name) {
@@ -340,6 +421,9 @@ impl Filesystem for FtpFs {
                     directory: false,
                     symlink: false,
                     modified: 0,
+                    link_target: None,
+                    perm: 0o644,
+                    nlink: 1,
                 };
                 let n = self.intern(path.clone(), &e);
                 let mut s = self.state.lock().unwrap();
@@ -356,6 +440,59 @@ impl Filesystem for FtpFs {
                 reply.created(&self.ttl, &Self::attr(&n), 0, fh, 0)
             }
             Err(e) => reply.error(Self::errno(&e)),
+        }
+    }
+    fn mknod(
+        &mut self,
+        _: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let Some(p) = self.node(parent) else {
+            return reply.error(libc::ENOENT);
+        };
+        let path = Self::child(&p, name);
+        match self.remote.upload(&path, &[]) {
+            Ok(()) => {
+                let e = ListEntry {
+                    name: name.to_string_lossy().into(),
+                    size: 0,
+                    directory: false,
+                    symlink: false,
+                    modified: 0,
+                    link_target: None,
+                    perm: 0o644,
+                    nlink: 1,
+                };
+                let n = self.intern(path, &e);
+                reply.entry(&self.ttl, &Self::attr(&n), 0)
+            }
+            Err(e) => reply.error(Self::errno(&e)),
+        }
+    }
+    fn fsync(&mut self, _: &Request<'_>, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        let upload = {
+            let s = self.state.lock().unwrap();
+            s.handles
+                .get(&fh)
+                .filter(|h| h.dirty)
+                .map(|h| (h.path.clone(), h.data.clone()))
+        };
+        match upload {
+            Some((path, data)) => match self.remote.upload(&path, &data) {
+                Ok(()) => {
+                    if let Some(h) = self.state.lock().unwrap().handles.get_mut(&fh) {
+                        h.dirty = false;
+                    }
+                    reply.ok()
+                }
+                Err(e) => reply.error(Self::errno(&e)),
+            },
+            None => reply.ok(),
         }
     }
     fn mkdir(
@@ -382,6 +519,9 @@ impl Filesystem for FtpFs {
                     directory: true,
                     symlink: false,
                     modified: 0,
+                    link_target: None,
+                    perm: 0o755,
+                    nlink: 2,
                 };
                 let n = self.intern(path, &e);
                 reply.entry(&self.ttl, &Self::attr(&n), 0)
@@ -427,7 +567,7 @@ impl Filesystem for FtpFs {
         &mut self,
         _: &Request<'_>,
         ino: u64,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
@@ -444,6 +584,26 @@ impl Filesystem for FtpFs {
         let Some(mut n) = self.node(ino) else {
             return reply.error(libc::ENOENT);
         };
+        if let Some(mode) = mode {
+            let Some(parent) = n.path.parent() else {
+                return reply.error(libc::EINVAL);
+            };
+            let Some(name) = n.path.file_name() else {
+                return reply.error(libc::EINVAL);
+            };
+            if let Err(e) = self.remote.command(
+                parent,
+                format!(
+                    "SITE CHMOD {:03o} {}",
+                    mode & 0o7777,
+                    name.to_string_lossy()
+                ),
+            ) {
+                return reply.error(Self::errno(&e));
+            }
+            n.perm = (mode & 0o7777) as u16;
+            self.state.lock().unwrap().by_ino.insert(ino, n.clone());
+        }
         if let Some(size) = size {
             match self.remote.download(&n.path).and_then(|mut d| {
                 d.resize(size as usize, 0);

@@ -29,9 +29,11 @@ curlftpfs options (usable after -o):
     cacert=FILE, capath=DIR, ciphers=LIST
     interface=NAME             outgoing network interface
     proxy=URL, proxy_user=U:P  proxy settings
+    proxy_anyauth | proxy_basic | proxy_digest | proxy_ntlm
     proxytunnel                tunnel through HTTP proxy
     httpproxy | socks4 | socks5 select proxy kind
     ipv4 | ipv6               address family
+    tlsv1 | sslv3             TLS protocol compatibility
     cache_timeout=SECONDS      metadata cache lifetime (default: 10)
 
 Standard FUSE options such as ro, rw, allow_other, default_permissions,
@@ -43,6 +45,7 @@ pub enum ParseResult {
     Help,
     Version,
 }
+
 pub struct Args {
     pub url: String,
     pub mountpoint: PathBuf,
@@ -147,12 +150,20 @@ fn parse_option(
         "interface" => c.interface = Some(val!().into()),
         "proxy" => c.proxy = Some(val!().into()),
         "proxy_user" => c.proxy_user = Some(val!().into()),
+        "proxy_anyauth" => c.proxy_auth = curl_sys::CURLAUTH_ANY,
+        "proxy_basic" => c.proxy_auth |= curl_sys::CURLAUTH_BASIC,
+        "proxy_digest" => c.proxy_auth |= curl_sys::CURLAUTH_DIGEST,
+        "proxy_ntlm" => c.proxy_auth |= curl_sys::CURLAUTH_NTLM,
         "proxytunnel" => c.proxy_tunnel = true,
         "httpproxy" => c.proxy_type = curl::easy::ProxyType::Http,
         "socks4" => c.proxy_type = curl::easy::ProxyType::Socks4,
         "socks5" => c.proxy_type = curl::easy::ProxyType::Socks5,
         "ipv4" => c.ip = curl::easy::IpResolve::V4,
         "ipv6" => c.ip = curl::easy::IpResolve::V6,
+        "tlsv1" => c.ssl_version = Some(curl_sys::CURL_SSLVERSION_TLSv1 as i64),
+        "sslv3" => c.ssl_version = Some(curl_sys::CURL_SSLVERSION_SSLv3 as i64),
+        "engine" => c.engine = Some(val!().into()),
+        "krb4" => c.krb4 = Some(val!().into()),
         "cache_timeout" => {
             *cache = Duration::from_secs(val!().parse().map_err(|_| "invalid cache_timeout")?)
         }
@@ -171,11 +182,36 @@ fn parse_option(
         "atime" => fuse.push(MountOption::Atime),
         "noatime" => fuse.push(MountOption::NoAtime),
         "relatime" => fuse.push(MountOption::CUSTOM("relatime".into())),
-        "transform_symlinks" | "tryutf8" | "utf8" | "nomulticonn" | "ftpfs_debug" | "codepage"
-        | "iocharset" => log::warn!("legacy option {key} is accepted but no longer necessary"),
+        "codepage" => c.codepage = Some(val!().into()),
+        "iocharset" => c.iocharset = Some(val!().into()),
+        "transform_symlinks" => c.transform_symlinks = true,
+        "tryutf8" | "utf8" | "nomulticonn" | "ftpfs_debug" => {
+            log::warn!("legacy option {key} is accepted but no longer necessary")
+        }
         "fsname" => fuse.push(MountOption::FSName(val!().into())),
         "subtype" => fuse.push(MountOption::Subtype(val!().into())),
         _ => fuse.push(MountOption::CUSTOM(o.into())),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parses_legacy_curl_options() {
+        let ParseResult::Run(parsed) = (match Args::parse(&args(&["curlftpfs", "-o", "disable_epsv,disable_eprt,skip_pasv_ip,ftp_port=eth0,ftp_method=nocwd,ssl,proxy_digest,tlsv1", "host", "/mnt"])) { Ok(result) => result, Err(error) => panic!("{error}") }) else { panic!("expected run") };
+        assert!(!parsed.curl.epsv);
+        assert!(!parsed.curl.eprt);
+        assert!(parsed.curl.skip_pasv_ip);
+        assert_eq!(parsed.curl.ftp_port.as_deref(), Some("eth0"));
+        assert_eq!(parsed.curl.ftp_method.as_deref(), Some("nocwd"));
+        assert_ne!(parsed.curl.proxy_auth, 0);
+        assert!(parsed.curl.ssl_version.is_some());
+    }
 }
