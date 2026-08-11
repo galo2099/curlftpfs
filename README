@@ -1,62 +1,59 @@
 CurlFtpFS
 =========
 
-CurlFtpFS is a filesystem for acessing ftp hosts based on FUSE and
-libcurl. It automatically reconnects if the server times out. 
-
-My motivation to start this project was to learn how to program using
-Curl (http://curl.haxx.se) and Fuse (http://fuse.sourceforge.net). I
-also wanted to maintain my website (http://www.golaberto.com.br) using
-the tools that I was used to, like cd, mv, cp and vim.
-
-As the FTP protocol is not very feature rich, this filesystem does not
-fulfill every constraint of a real filesystem, but it should be usable
-for simple tasks like copying and editing files.
+CurlFtpFS mounts an FTP or FTPS server as a local filesystem. This version is
+implemented in safe Rust and uses the `fuser` FUSE library and the `curl` crate
+(libcurl) for transport. It reconnects on each operation, so an FTP server
+closing an idle control connection does not invalidate the mount.
 
 Requirements
-============
+------------
 
-glib-2.0
-libcurl >= 7.17.0
+* Rust 1.70 or newer
+* libcurl development files
+* A kernel with FUSE support (`fusermount3` is normally supplied by fuse3)
 
+Build and install
+-----------------
 
-Compilation and Installation
-============================
-
-./configure
-make
-make install
+    cargo build --release
+    install -Dm755 target/release/curlftpfs /usr/local/bin/curlftpfs
+    install -Dm644 doc/curlftpfs.1 /usr/local/share/man/man1/curlftpfs.1
 
 Usage
-=====
+-----
 
-curlftpfs <ftpsite> <mountpoint>
+    curlftpfs [options] <ftp-host-or-url> <mountpoint>
 
-ex.:
-curlftpfs ftp://ftp.sunet.se/ sunet/
+For example:
 
+    curlftpfs -o user=alice:secret,allow_other ftp.example.org /mnt/ftp
 
-Debugging
-=========
+Run `curlftpfs --help` for the compatibility options. Existing curlftpfs
+options are accepted with the traditional comma-separated `-o` syntax,
+including passive/active mode, TLS certificates, proxies, address selection,
+and metadata cache settings. Standard FUSE mount options are passed to FUSE.
 
-curlftpfs -f -v -o debug,ftpfs_debug=3 <ftpsite> <mountpoint> 
+Filesystem behavior
+-------------------
 
-(runs the curlftpfs in foreground and shows libcurl verbose debug output)  
+Directory metadata is obtained with MLSD by default. Reads are downloaded
+through libcurl. A writable file handle is buffered and uploaded on flush or
+close, which preserves random-write behavior expected by editors while working
+within FTP's whole-object upload model. Create, truncate, mkdir, unlink, rmdir,
+and rename operations are translated into FTP operations.
 
+FTP does not provide all POSIX semantics. Ownership and permissions are
+therefore synthesized locally, and concurrent writers to one remote path use
+last-close-wins behavior.
 
-Known Problems
-==============
+Testing
+-------
 
-1) Several GUI application (gedit, leafpad,...) use open(O_RDWR) + seek mode for saving files 
-which cannot be supported by the FTP protocol. Therefore saving files might throw an error.
-Hopefully future kernels will provide special errno's to make it easier to 
-deal with less capable file-systems.
+    cargo test
+    cargo clippy --all-targets -- -D warnings
 
-2) There seems to be a bug in libcurl 7.18 which sometimes causes problems reading files. 
-Should be fixed in libcurl >= 7.18.2
+License
+-------
 
-http://sourceforge.net/tracker/index.php?func=detail&aid=1951588&group_id=976&atid=100976
-
-
-
-
+GNU General Public License version 2 or later. See `COPYING`.

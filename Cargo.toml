@@ -1,0 +1,18 @@
+[package]
+name = "curlftpfs"
+version = "0.9.3"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Mount an FTP host as a local filesystem using FUSE and libcurl"
+
+[dependencies]
+curl = "0.4"
+curl-sys = "0.4"
+fuser = { version = "0.14", default-features = false, features = ["abi-7-31"] }
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = true
+strip = true
