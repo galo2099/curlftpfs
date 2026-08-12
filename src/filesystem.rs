@@ -4,14 +4,15 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant, SystemTime},
 };
 const ROOT: u64 = 1;
+const MAX_DIRECTORY_CACHE_ENTRIES: usize = 10_000;
 
 #[derive(Clone)]
 struct Node {
@@ -29,6 +30,78 @@ struct Handle {
     data: Vec<u8>,
     dirty: bool,
 }
+struct CachedDirectory {
+    entries: Arc<[ListEntry]>,
+    cached_at: Instant,
+}
+struct DirectoryCache {
+    timeout: Duration,
+    max_entries: usize,
+    revision: u64,
+    directories: HashMap<PathBuf, CachedDirectory>,
+    in_flight: HashSet<PathBuf>,
+}
+impl DirectoryCache {
+    fn new(timeout: Duration) -> Self {
+        Self::with_limit(timeout, MAX_DIRECTORY_CACHE_ENTRIES)
+    }
+    fn with_limit(timeout: Duration, max_entries: usize) -> Self {
+        Self {
+            timeout,
+            max_entries,
+            revision: 0,
+            directories: HashMap::new(),
+            in_flight: HashSet::new(),
+        }
+    }
+    fn get(&mut self, path: &Path, now: Instant) -> Option<Arc<[ListEntry]>> {
+        let valid = self
+            .directories
+            .get(path)
+            .is_some_and(|cached| now.saturating_duration_since(cached.cached_at) < self.timeout);
+        if valid {
+            return self
+                .directories
+                .get(path)
+                .map(|cached| cached.entries.clone());
+        }
+        self.directories.remove(path);
+        None
+    }
+    fn insert(&mut self, path: PathBuf, entries: Arc<[ListEntry]>, now: Instant, revision: u64) {
+        if self.timeout.is_zero() || self.max_entries == 0 || self.revision != revision {
+            return;
+        }
+        self.directories
+            .retain(|_, cached| now.saturating_duration_since(cached.cached_at) < self.timeout);
+        if !self.directories.contains_key(&path) && self.directories.len() >= self.max_entries {
+            if let Some(oldest) = self
+                .directories
+                .iter()
+                .min_by_key(|(_, cached)| cached.cached_at)
+                .map(|(path, _)| path.clone())
+            {
+                self.directories.remove(&oldest);
+            }
+        }
+        self.directories.insert(
+            path,
+            CachedDirectory {
+                entries,
+                cached_at: now,
+            },
+        );
+    }
+    fn invalidate(&mut self, path: &Path) {
+        self.revision = self.revision.wrapping_add(1);
+        self.directories.remove(path);
+    }
+    fn invalidate_tree(&mut self, path: &Path) {
+        self.revision = self.revision.wrapping_add(1);
+        self.directories
+            .retain(|cached_path, _| !cached_path.starts_with(path));
+    }
+}
 struct State {
     next_ino: u64,
     next_fh: u64,
@@ -39,6 +112,8 @@ struct State {
 pub struct FtpFs {
     remote: Arc<Remote>,
     state: Mutex<State>,
+    directory_cache: Mutex<DirectoryCache>,
+    directory_cache_changed: Condvar,
     ttl: Duration,
     mountpoint: PathBuf,
     transform_symlinks: bool,
@@ -73,6 +148,8 @@ impl FtpFs {
                 by_path,
                 handles: HashMap::new(),
             }),
+            directory_cache: Mutex::new(DirectoryCache::new(ttl)),
+            directory_cache_changed: Condvar::new(),
             ttl,
             mountpoint,
             transform_symlinks,
@@ -159,6 +236,66 @@ impl FtpFs {
     fn child(parent: &Node, name: &OsStr) -> PathBuf {
         parent.path.join(name)
     }
+    fn list_directory(&self, path: &Path) -> io::Result<Arc<[ListEntry]>> {
+        let (revision, should_cache) = {
+            let mut cache = self.directory_cache.lock().unwrap();
+            loop {
+                if let Some(entries) = cache.get(path, Instant::now()) {
+                    return Ok(entries);
+                }
+                if cache.timeout.is_zero() {
+                    break (cache.revision, false);
+                }
+                if cache.in_flight.insert(path.to_path_buf()) {
+                    break (cache.revision, true);
+                }
+                cache = self.directory_cache_changed.wait(cache).unwrap();
+            }
+        };
+        let result = self.remote.list(path).map(Arc::<[ListEntry]>::from);
+        if should_cache {
+            let mut cache = self.directory_cache.lock().unwrap();
+            cache.in_flight.remove(path);
+            if let Ok(entries) = &result {
+                cache.insert(
+                    path.to_path_buf(),
+                    Arc::clone(entries),
+                    Instant::now(),
+                    revision,
+                );
+            }
+            self.directory_cache_changed.notify_all();
+        }
+        result
+    }
+    fn invalidate_parent_directory(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            self.directory_cache.lock().unwrap().invalidate(parent);
+        }
+    }
+    fn invalidate_path_and_parent(&self, path: &Path) {
+        let mut cache = self.directory_cache.lock().unwrap();
+        cache.invalidate_tree(path);
+        if let Some(parent) = path.parent() {
+            cache.invalidate(parent);
+        }
+    }
+    fn invalidate_rename(&self, old: &Path, new: &Path) {
+        let mut cache = self.directory_cache.lock().unwrap();
+        cache.invalidate_tree(old);
+        cache.invalidate_tree(new);
+        if let Some(parent) = old.parent() {
+            cache.invalidate(parent);
+        }
+        if let Some(parent) = new.parent() {
+            cache.invalidate(parent);
+        }
+    }
+    fn upload_file(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        self.remote.upload(path, data)?;
+        self.invalidate_parent_directory(path);
+        Ok(())
+    }
     fn remove_node(&self, path: &Path) {
         let mut s = self.state.lock().unwrap();
         if let Some(i) = s.by_path.remove(path) {
@@ -206,8 +343,7 @@ impl FtpFs {
             return Ok(None);
         };
         Ok(self
-            .remote
-            .list(parent)?
+            .list_directory(parent)?
             .iter()
             .find(|entry| OsStr::new(&entry.name) == name)
             .map(|entry| self.intern(node.path.clone(), entry)))
@@ -267,7 +403,7 @@ impl Filesystem for FtpFs {
             return reply.error(libc::ENOENT);
         };
         let path = Self::child(&p, name);
-        match self.remote.list(&p.path) {
+        match self.list_directory(&p.path) {
             Ok(entries) => {
                 if let Some(e) = entries.iter().find(|e| OsStr::new(&e.name) == name) {
                     let n = self.intern(path, e);
@@ -290,7 +426,7 @@ impl Filesystem for FtpFs {
         let Some(dir) = self.node(ino) else {
             return reply.error(libc::ENOENT);
         };
-        match self.remote.list(&dir.path) {
+        match self.list_directory(&dir.path) {
             Ok(entries) => {
                 let parent = dir
                     .path
@@ -301,9 +437,9 @@ impl Filesystem for FtpFs {
                     (ROOT, FileType::Directory, OsString::from(".")),
                     (parent, FileType::Directory, OsString::from("..")),
                 ];
-                for e in entries {
-                    let n = self.intern(dir.path.join(&e.name), &e);
-                    all.push((n.ino, n.kind, e.name.into()));
+                for e in entries.iter() {
+                    let n = self.intern(dir.path.join(&e.name), e);
+                    all.push((n.ino, n.kind, OsString::from(&e.name)));
                 }
                 for (i, (ino, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
                     if reply.add(ino, (i + 1) as i64, kind, name) {
@@ -397,7 +533,7 @@ impl Filesystem for FtpFs {
                 .map(|h| (h.path.clone(), h.data.clone()))
         };
         match upload {
-            Some((p, d)) => match self.remote.upload(&p, &d) {
+            Some((p, d)) => match self.upload_file(&p, &d) {
                 Ok(()) => {
                     if let Some(h) = self.state.lock().unwrap().handles.get_mut(&fh) {
                         h.dirty = false
@@ -421,7 +557,7 @@ impl Filesystem for FtpFs {
     ) {
         let h = self.state.lock().unwrap().handles.remove(&fh);
         if let Some(h) = h.filter(|h| h.dirty) {
-            match self.remote.upload(&h.path, &h.data) {
+            match self.upload_file(&h.path, &h.data) {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(Self::errno(&e)),
             }
@@ -443,7 +579,7 @@ impl Filesystem for FtpFs {
             return reply.error(libc::ENOENT);
         };
         let path = Self::child(&p, name);
-        match self.remote.upload(&path, &[]) {
+        match self.upload_file(&path, &[]) {
             Ok(()) => {
                 let e = ListEntry {
                     name: name.to_string_lossy().into(),
@@ -486,7 +622,7 @@ impl Filesystem for FtpFs {
             return reply.error(libc::ENOENT);
         };
         let path = Self::child(&p, name);
-        match self.remote.upload(&path, &[]) {
+        match self.upload_file(&path, &[]) {
             Ok(()) => {
                 let e = ListEntry {
                     name: name.to_string_lossy().into(),
@@ -513,7 +649,7 @@ impl Filesystem for FtpFs {
                 .map(|h| (h.path.clone(), h.data.clone()))
         };
         match upload {
-            Some((path, data)) => match self.remote.upload(&path, &data) {
+            Some((path, data)) => match self.upload_file(&path, &data) {
                 Ok(()) => {
                     if let Some(h) = self.state.lock().unwrap().handles.get_mut(&fh) {
                         h.dirty = false;
@@ -543,6 +679,7 @@ impl Filesystem for FtpFs {
             .command(Path::new("/"), format!("MKD {}", path.to_string_lossy()))
         {
             Ok(()) => {
+                self.invalidate_path_and_parent(&path);
                 let e = ListEntry {
                     name: name.to_string_lossy().into(),
                     size: 0,
@@ -587,6 +724,7 @@ impl Filesystem for FtpFs {
         );
         match self.remote.command(Path::new("/"), cmd) {
             Ok(()) => {
+                self.invalidate_rename(&old, &new);
                 self.rename_node(&old, &new);
                 reply.ok()
             }
@@ -625,13 +763,14 @@ impl Filesystem for FtpFs {
             ) {
                 return reply.error(Self::errno(&e));
             }
+            self.invalidate_parent_directory(&n.path);
             n.perm = (mode & 0o7777) as u16;
             self.state.lock().unwrap().by_ino.insert(ino, n.clone());
         }
         if let Some(size) = size {
             match self.remote.download(&n.path).and_then(|mut d| {
                 d.resize(size as usize, 0);
-                self.remote.upload(&n.path, &d)
+                self.upload_file(&n.path, &d)
             }) {
                 Ok(()) => {
                     n.size = size;
@@ -656,6 +795,7 @@ impl FtpFs {
         );
         match self.remote.command(Path::new("/"), cmd) {
             Ok(()) => {
+                self.invalidate_path_and_parent(&path);
                 self.remove_node(&path);
                 reply.ok()
             }
@@ -679,6 +819,120 @@ mod tests {
             link_target: None,
             perm: if directory { 0o755 } else { 0o644 },
             nlink: if directory { 2 } else { 1 },
+        }
+    }
+
+    fn cache_directory(cache: &mut DirectoryCache, path: &str, name: &str, now: Instant) {
+        cache.insert(
+            path.into(),
+            Arc::from(vec![entry(name, false)]),
+            now,
+            cache.revision,
+        );
+    }
+
+    #[test]
+    fn directory_cache_reuses_entries_until_timeout() {
+        let start = Instant::now();
+        let mut cache = DirectoryCache::new(Duration::from_secs(10));
+        cache_directory(&mut cache, "/", "file", start);
+
+        let cached = cache.get(Path::new("/"), start + Duration::from_secs(9));
+        assert_eq!(cached.unwrap()[0].name, "file");
+        assert!(cache
+            .get(Path::new("/"), start + Duration::from_secs(10))
+            .is_none());
+        assert!(cache.directories.is_empty());
+    }
+
+    #[test]
+    fn directory_cache_shares_listing_storage() {
+        let start = Instant::now();
+        let mut cache = DirectoryCache::new(Duration::from_secs(10));
+        let entries: Arc<[ListEntry]> = Arc::from(vec![entry("file", false)]);
+        cache.insert("/".into(), Arc::clone(&entries), start, cache.revision);
+
+        let cached = cache.get(Path::new("/"), start).unwrap();
+        assert!(Arc::ptr_eq(&entries, &cached));
+    }
+
+    #[test]
+    fn zero_timeout_disables_directory_cache() {
+        let start = Instant::now();
+        let mut cache = DirectoryCache::new(Duration::ZERO);
+        cache_directory(&mut cache, "/", "file", start);
+
+        assert!(cache.get(Path::new("/"), start).is_none());
+        assert!(cache.directories.is_empty());
+    }
+
+    #[test]
+    fn directory_cache_is_bounded() {
+        let start = Instant::now();
+        let mut cache = DirectoryCache::with_limit(Duration::from_secs(60), 2);
+        cache_directory(&mut cache, "/first", "first", start);
+        cache_directory(
+            &mut cache,
+            "/second",
+            "second",
+            start + Duration::from_secs(1),
+        );
+        cache_directory(
+            &mut cache,
+            "/third",
+            "third",
+            start + Duration::from_secs(2),
+        );
+
+        assert_eq!(cache.directories.len(), 2);
+        assert!(!cache.directories.contains_key(Path::new("/first")));
+        assert!(cache.directories.contains_key(Path::new("/second")));
+        assert!(cache.directories.contains_key(Path::new("/third")));
+    }
+
+    #[test]
+    fn invalidation_discards_in_flight_listing() {
+        let start = Instant::now();
+        let mut cache = DirectoryCache::new(Duration::from_secs(10));
+        let listing_revision = cache.revision;
+        cache.invalidate(Path::new("/"));
+        cache.insert(
+            "/".into(),
+            Arc::from(vec![entry("stale", false)]),
+            start,
+            listing_revision,
+        );
+
+        assert!(cache.get(Path::new("/"), start).is_none());
+    }
+
+    #[test]
+    fn rename_invalidates_parents_and_cached_subtrees() {
+        let remote = Remote::new("ftp://example.test/".into(), CurlConfig::default()).unwrap();
+        let fs = FtpFs::new(remote, Duration::from_secs(10), "/mnt".into(), false);
+        let start = Instant::now();
+        {
+            let mut cache = fs.directory_cache.lock().unwrap();
+            for path in [
+                "/",
+                "/from",
+                "/from/old",
+                "/from/old/nested",
+                "/to",
+                "/to/new",
+                "/other",
+            ] {
+                cache_directory(&mut cache, path, "file", start);
+            }
+        }
+
+        fs.invalidate_rename(Path::new("/from/old"), Path::new("/to/new"));
+
+        let cache = fs.directory_cache.lock().unwrap();
+        assert!(cache.directories.contains_key(Path::new("/")));
+        assert!(cache.directories.contains_key(Path::new("/other")));
+        for invalidated in ["/from", "/from/old", "/from/old/nested", "/to", "/to/new"] {
+            assert!(!cache.directories.contains_key(Path::new(invalidated)));
         }
     }
 

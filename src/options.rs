@@ -34,7 +34,7 @@ curlftpfs options (usable after -o):
     httpproxy | socks4 | socks5 select proxy kind
     ipv4 | ipv6               address family
     tlsv1 | sslv3             TLS protocol compatibility
-    cache_timeout=SECONDS      metadata cache lifetime (default: 10)
+    cache_timeout=SECONDS      metadata/listing cache lifetime (default: 10)
 
 Standard FUSE options such as ro, rw, allow_other, default_permissions,
 auto_unmount, nodev, noexec, nosuid, sync, dirsync, and fsname=NAME are passed on.
