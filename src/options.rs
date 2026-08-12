@@ -67,8 +67,8 @@ impl Args {
                 "-h" | "--help" => return Ok(ParseResult::Help),
                 "-V" | "--version" => return Ok(ParseResult::Version),
                 "-v" | "--verbose" => cfg.verbose = true,
-                "-f" => fuse.push(MountOption::CUSTOM("-f".into())),
-                "-s" => fuse.push(MountOption::CUSTOM("-s".into())),
+                // fuser::mount2 is already foreground and single-threaded.
+                "-f" | "-s" => {}
                 "-o" => {
                     i += 1;
                     let value = argv
@@ -213,5 +213,15 @@ mod tests {
         assert_eq!(parsed.curl.ftp_method.as_deref(), Some("nocwd"));
         assert_ne!(parsed.curl.proxy_auth, 0);
         assert!(parsed.curl.ssl_version.is_some());
+    }
+
+    #[test]
+    fn accepts_foreground_and_single_thread_flags() {
+        let ParseResult::Run(parsed) =
+            Args::parse(&args(&["curlftpfs", "-f", "-s", "host", "/mnt"])).unwrap()
+        else {
+            panic!("expected run")
+        };
+        assert!(parsed.mount_options.is_empty());
     }
 }

@@ -214,6 +214,12 @@ impl Remote {
         }
         Ok(e)
     }
+    fn directory_easy(&self, path: &Path) -> io::Result<Easy> {
+        // libcurl treats an FTP URL without a trailing slash as a file.
+        let mut directory = path.to_path_buf();
+        directory.push("");
+        self.easy(&directory)
+    }
     pub fn download(&self, path: &Path) -> io::Result<Vec<u8>> {
         let _g = self.lock.lock().unwrap();
         let mut e = self.easy(path)?;
@@ -260,7 +266,7 @@ impl Remote {
     }
 
     fn list_command(&self, path: &Path, command: &str) -> io::Result<Vec<ListEntry>> {
-        let mut e = self.easy(path)?;
+        let mut e = self.directory_easy(path)?;
         e.custom_request(command).map_err(err)?;
         let mut out = Vec::new();
         {
@@ -303,7 +309,7 @@ impl Remote {
     }
     pub fn command(&self, path: &Path, command: String) -> io::Result<()> {
         let _g = self.lock.lock().unwrap();
-        let mut e = self.easy(path)?;
+        let mut e = self.directory_easy(path)?;
         e.nobody(true).map_err(err)?;
         let mut list = std::ptr::null_mut();
         for command in command.lines() {
@@ -586,5 +592,13 @@ mod tests {
     #[test]
     fn escapes_paths() {
         assert_eq!(url_encode("a b"), "a%20b");
+    }
+
+    #[test]
+    fn preserves_directory_trailing_slash() {
+        let remote = Remote::new("ftp://example.test/".into(), CurlConfig::default()).unwrap();
+        let mut path = std::path::PathBuf::from("/nested directory");
+        path.push("");
+        assert_eq!(remote.url(&path), "ftp://example.test/nested%20directory/");
     }
 }

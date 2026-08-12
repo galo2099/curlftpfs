@@ -9,11 +9,16 @@ description = "Mount an FTP host as a local filesystem using FUSE and libcurl"
 curl = "0.4"
 curl-sys = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-fuser = { version = "0.14", default-features = false, features = ["abi-7-31"] }
 libc = "0.2"
 log = "0.4"
 env_logger = "0.11"
 encoding_rs = "0.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.14", default-features = false, features = ["abi-7-31"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+fuser = { version = "0.14", default-features = false, features = ["abi-7-31", "libfuse"] }
 
 [profile.release]
 lto = true

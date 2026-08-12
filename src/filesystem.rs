@@ -165,6 +165,36 @@ impl FtpFs {
             s.by_ino.remove(&i);
         }
     }
+    fn rename_node(&self, old: &Path, new: &Path) {
+        let mut s = self.state.lock().unwrap();
+        let moved: Vec<(PathBuf, PathBuf, u64)> = s
+            .by_path
+            .iter()
+            .filter_map(|(path, ino)| {
+                let suffix = path.strip_prefix(old).ok()?;
+                let target = if suffix.as_os_str().is_empty() {
+                    new.to_path_buf()
+                } else {
+                    new.join(suffix)
+                };
+                Some((path.clone(), target, *ino))
+            })
+            .collect();
+        let moved_inodes: Vec<u64> = moved.iter().map(|(_, _, ino)| *ino).collect();
+        for (source, _, _) in &moved {
+            s.by_path.remove(source);
+        }
+        for (_, target, ino) in moved {
+            if let Some(replaced) = s.by_path.insert(target.clone(), ino) {
+                if !moved_inodes.contains(&replaced) {
+                    s.by_ino.remove(&replaced);
+                }
+            }
+            if let Some(node) = s.by_ino.get_mut(&ino) {
+                node.path = target;
+            }
+        }
+    }
     fn refresh_node(&self, node: &Node) -> io::Result<Option<Node>> {
         if node.ino == ROOT {
             return Ok(Some(node.clone()));
@@ -510,7 +540,7 @@ impl Filesystem for FtpFs {
         let path = Self::child(&p, name);
         match self
             .remote
-            .command(&p.path, format!("MKD {}", name.to_string_lossy()))
+            .command(Path::new("/"), format!("MKD {}", path.to_string_lossy()))
         {
             Ok(()) => {
                 let e = ListEntry {
@@ -557,7 +587,7 @@ impl Filesystem for FtpFs {
         );
         match self.remote.command(Path::new("/"), cmd) {
             Ok(()) => {
-                self.remove_node(&old);
+                self.rename_node(&old, &new);
                 reply.ok()
             }
             Err(e) => reply.error(Self::errno(&e)),
@@ -585,18 +615,12 @@ impl Filesystem for FtpFs {
             return reply.error(libc::ENOENT);
         };
         if let Some(mode) = mode {
-            let Some(parent) = n.path.parent() else {
-                return reply.error(libc::EINVAL);
-            };
-            let Some(name) = n.path.file_name() else {
-                return reply.error(libc::EINVAL);
-            };
             if let Err(e) = self.remote.command(
-                parent,
+                Path::new("/"),
                 format!(
                     "SITE CHMOD {:03o} {}",
                     mode & 0o7777,
-                    name.to_string_lossy()
+                    n.path.to_string_lossy()
                 ),
             ) {
                 return reply.error(Self::errno(&e));
@@ -628,14 +652,51 @@ impl FtpFs {
         let cmd = format!(
             "{} {}",
             if dir { "RMD" } else { "DELE" },
-            name.to_string_lossy()
+            path.to_string_lossy()
         );
-        match self.remote.command(&p.path, cmd) {
+        match self.remote.command(Path::new("/"), cmd) {
             Ok(()) => {
                 self.remove_node(&path);
                 reply.ok()
             }
             Err(e) => reply.error(Self::errno(&e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::CurlConfig;
+
+    fn entry(name: &str, directory: bool) -> ListEntry {
+        ListEntry {
+            name: name.into(),
+            size: 0,
+            directory,
+            symlink: false,
+            modified: 0,
+            link_target: None,
+            perm: if directory { 0o755 } else { 0o644 },
+            nlink: if directory { 2 } else { 1 },
+        }
+    }
+
+    #[test]
+    fn rename_updates_cached_descendant_paths() {
+        let remote = Remote::new("ftp://example.test/".into(), CurlConfig::default()).unwrap();
+        let fs = FtpFs::new(remote, Duration::from_secs(1), "/mnt".into(), false);
+        let directory = fs.intern("/old".into(), &entry("old", true));
+        let child = fs.intern("/old/file".into(), &entry("file", false));
+
+        fs.rename_node(Path::new("/old"), Path::new("/new"));
+
+        let state = fs.state.lock().unwrap();
+        assert_eq!(state.by_path.get(Path::new("/new")), Some(&directory.ino));
+        assert_eq!(state.by_path.get(Path::new("/new/file")), Some(&child.ino));
+        assert_eq!(state.by_ino[&directory.ino].path, Path::new("/new"));
+        assert_eq!(state.by_ino[&child.ino].path, Path::new("/new/file"));
+        assert!(!state.by_path.contains_key(Path::new("/old")));
+        assert!(!state.by_path.contains_key(Path::new("/old/file")));
     }
 }
